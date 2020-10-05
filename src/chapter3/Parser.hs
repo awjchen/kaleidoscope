@@ -1,5 +1,9 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Parser where
 
+import qualified Data.ByteString.Char8 as BS
+import Data.Functor.Identity
 import Text.Parsec
 import Text.Parsec.String (Parser)
 import Control.Applicative ((<$>))
@@ -18,7 +22,11 @@ int = do
 floating :: Parser Expr
 floating = Float <$> float
 
-binary s assoc = Ex.Infix (reservedOp s >> return (BinaryOp s)) assoc
+binary
+  :: BS.ByteString
+  -> Ex.Assoc
+  -> Ex.Operator String () Identity Expr
+binary s assoc = Ex.Infix (reservedOp (BS.unpack s) >> return (BinaryOp s)) assoc
 
 binops = [[binary "*" Ex.AssocLeft,
           binary "/" Ex.AssocLeft]

@@ -1,10 +1,12 @@
 module Syntax where
 
-type Name = String
+import qualified Data.ByteString.Char8 as BS
+
+type Name = BS.ByteString
 
 data Expr
   = Float Double
-  | Var String
+  | Var BS.ByteString
   | Call Name [Expr]
   | Function Name [Name] Expr
   | Extern Name [Name]

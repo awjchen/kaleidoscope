@@ -1,5 +1,6 @@
-resolver: lts-8.13
+resolver: lts-16.11
 packages:
 - '.'
-extra-deps:
-- llvm-hs-4.0.1.0
+nix:
+  packages:
+    - llvm_9

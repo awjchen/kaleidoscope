@@ -1,5 +1,6 @@
 module Lexer where
 
+import qualified Data.ByteString.Char8 as BS
 import Text.Parsec.String (Parser)
 import Text.Parsec.Language (emptyDef)
 
@@ -21,7 +22,7 @@ float      = Tok.float lexer
 parens     = Tok.parens lexer
 commaSep   = Tok.commaSep lexer
 semiSep    = Tok.semiSep lexer
-identifier = Tok.identifier lexer
+identifier = BS.pack <$> Tok.identifier lexer
 whitespace = Tok.whiteSpace lexer
 reserved   = Tok.reserved lexer
 reservedOp = Tok.reservedOp lexer

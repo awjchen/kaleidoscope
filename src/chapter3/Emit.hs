@@ -10,6 +10,8 @@ import qualified LLVM.AST.Constant as C
 import qualified LLVM.AST.Float as F
 import qualified LLVM.AST.FloatingPointPredicate as FP
 
+import qualified Data.ByteString.Char8 as BS
+import qualified Data.ByteString.Short as BSS
 import Data.Word
 import Data.Int
 import Control.Monad.Except
@@ -19,8 +21,8 @@ import qualified Data.Map as Map
 import Codegen
 import qualified Syntax as S
 
-toSig :: [String] -> [(AST.Type, AST.Name)]
-toSig = map (\x -> (double, AST.Name x))
+toSig :: [BS.ByteString] -> [(AST.Type, AST.Name)]
+toSig = map (\x -> (double, AST.Name $ BSS.toShort x))
 
 codegenTop :: S.Expr -> LLVM ()
 codegenTop (S.Function name args body) = do
@@ -32,7 +34,7 @@ codegenTop (S.Function name args body) = do
       setBlock entry
       forM args $ \a -> do
         var <- alloca double
-        store var (local (AST.Name a))
+        store var (local (AST.Name $ BSS.toShort a))
         assign a var
       cgen body >>= ret
 
@@ -67,7 +69,7 @@ binops = Map.fromList [
 
 cgen :: S.Expr -> Codegen AST.Operand
 cgen (S.UnaryOp op a) = do
-  cgen $ S.Call ("unary" ++ op) [a]
+  cgen $ S.Call ("unary" <> op) [a]
 cgen (S.BinaryOp "=" (S.Var var) val) = do
   a <- getvar var
   cval <- cgen val
@@ -84,7 +86,7 @@ cgen (S.Var x) = getvar x >>= load
 cgen (S.Float n) = return $ cons $ C.Float (F.Double n)
 cgen (S.Call fn args) = do
   largs <- mapM cgen args
-  call (externf (AST.Name fn)) largs
+  call (externf (AST.Name $ BSS.toShort fn)) largs
 
 -------------------------------------------------------------------------------
 -- Compilation
@@ -95,9 +97,9 @@ liftError = runExceptT >=> either fail return
 
 codegen :: AST.Module -> [S.Expr] -> IO AST.Module
 codegen mod fns = withContext $ \context ->
-  liftError $ withModuleFromAST context newast $ \m -> do
+  withModuleFromAST context newast $ \m -> do
     llstr <- moduleLLVMAssembly m
-    putStrLn llstr
+    BS.putStrLn llstr
     return newast
   where
     modn    = mapM codegenTop fns
