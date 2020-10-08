@@ -6,6 +6,7 @@ import Emit
 
 import Control.Monad.Trans
 
+import qualified Data.ByteString.Char8 as BS
 import System.IO
 import System.Environment
 import System.Console.Haskeline
@@ -13,7 +14,7 @@ import System.Console.Haskeline
 import qualified LLVM.AST as AST
 
 initModule :: AST.Module
-initModule = emptyModule "my cool jit"
+initModule = emptyModule (BS.pack "my cool jit")
 
 process :: AST.Module -> String -> IO (Maybe AST.Module)
 process modo source = do

@@ -3,11 +3,14 @@
 
 module Codegen where
 
+import Data.Bifunctor (first)
 import Data.Word
 import Data.String
 import Data.List
 import Data.Function
 import qualified Data.Map as Map
+import qualified Data.ByteString.Char8 as BS
+import qualified Data.ByteString.Short as BSS
 
 import Control.Monad.State
 import Control.Applicative
@@ -32,27 +35,27 @@ newtype LLVM a = LLVM (State AST.Module a)
 runLLVM :: AST.Module -> LLVM a -> AST.Module
 runLLVM mod (LLVM m) = execState m mod
 
-emptyModule :: String -> AST.Module
-emptyModule label = defaultModule { moduleName = label }
+emptyModule :: BS.ByteString -> AST.Module
+emptyModule label = defaultModule { moduleName = BSS.toShort label }
 
 addDefn :: Definition -> LLVM ()
 addDefn d = do
   defs <- gets moduleDefinitions
   modify $ \s -> s { moduleDefinitions = defs ++ [d] }
 
-define ::  Type -> String -> [(Type, Name)] -> [BasicBlock] -> LLVM ()
+define ::  Type -> BS.ByteString -> [(Type, Name)] -> [BasicBlock] -> LLVM ()
 define retty label argtys body = addDefn $
   GlobalDefinition $ functionDefaults {
-    name        = Name label
+    name        = Name $ BSS.toShort label
   , parameters  = ([Parameter ty nm [] | (ty, nm) <- argtys], False)
   , returnType  = retty
   , basicBlocks = body
   }
 
-external ::  Type -> String -> [(Type, Name)] -> LLVM ()
+external ::  Type -> BS.ByteString -> [(Type, Name)] -> LLVM ()
 external retty label argtys = addDefn $
   GlobalDefinition $ functionDefaults {
-    name        = Name label
+    name        = Name $ BSS.toShort label
   , linkage     = L.External
   , parameters  = ([Parameter ty nm [] | (ty, nm) <- argtys], False)
   , returnType  = retty
@@ -71,19 +74,19 @@ double = FloatingPointType DoubleFP
 -- Names
 -------------------------------------------------------------------------------
 
-type Names = Map.Map String Int
+type Names = Map.Map BS.ByteString Int
 
-uniqueName :: String -> Names -> (String, Names)
+uniqueName :: BS.ByteString -> Names -> (BS.ByteString, Names)
 uniqueName nm ns =
   case Map.lookup nm ns of
     Nothing -> (nm,  Map.insert nm 1 ns)
-    Just ix -> (nm ++ show ix, Map.insert nm (ix+1) ns)
+    Just ix -> (nm <> BS.pack (show ix), Map.insert nm (ix+1) ns)
 
 -------------------------------------------------------------------------------
 -- Codegen State
 -------------------------------------------------------------------------------
 
-type SymbolTable = [(String, Operand)]
+type SymbolTable = [(BS.ByteString, Operand)]
 
 data CodegenState
   = CodegenState {
@@ -121,14 +124,15 @@ makeBlock (l, (BlockState _ s t)) = BasicBlock l (reverse s) (maketerm t)
     maketerm (Just x) = x
     maketerm Nothing = error $ "Block has no terminator: " ++ (show l)
 
-entryBlockName :: String
+entryBlockName :: BS.ByteString
 entryBlockName = "entry"
 
 emptyBlock :: Int -> BlockState
 emptyBlock i = BlockState i [] Nothing
 
 emptyCodegen :: CodegenState
-emptyCodegen = CodegenState (Name entryBlockName) Map.empty [] 1 0 Map.empty
+emptyCodegen =
+  CodegenState (Name $ BSS.toShort entryBlockName) Map.empty [] 1 0 Map.empty
 
 execCodegen :: Codegen a -> CodegenState
 execCodegen m = execState (runCodegen m) emptyCodegen
@@ -161,14 +165,14 @@ terminator trm = do
 entry :: Codegen Name
 entry = gets currentBlock
 
-addBlock :: String -> Codegen Name
+addBlock :: BS.ByteString -> Codegen Name
 addBlock bname = do
   bls <- gets blocks
   ix  <- gets blockCount
   nms <- gets names
 
   let new = emptyBlock ix
-      (qname, supply) = uniqueName bname nms
+      (qname, supply) = first BSS.toShort $ uniqueName bname nms
 
   modify $ \s -> s { blocks = Map.insert (Name qname) new bls
                    , blockCount = ix + 1
@@ -201,12 +205,12 @@ current = do
 -- Symbol Table
 -------------------------------------------------------------------------------
 
-assign :: String -> Operand -> Codegen ()
+assign :: BS.ByteString -> Operand -> Codegen ()
 assign var x = do
   lcls <- gets symtab
-  modify $ \s -> s { symtab = [(var, x)] ++ lcls }
+  modify $ \s -> s { symtab = [(var, x)] <> lcls }
 
-getvar :: String -> Codegen Operand
+getvar :: BS.ByteString -> Codegen Operand
 getvar var = do
   syms <- gets symtab
   case lookup var syms of
