@@ -1,7 +1,41 @@
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE OverloadedStrings #-}
 
-module Codegen where
+module Codegen
+  ( double
+
+  , localRef
+  , globalRef
+  , externfRef
+
+  , Codegen
+  , execCodegen
+  , entryBlockName
+  , addBlock
+  , setBlock
+
+  , assignVar
+  , getVar
+
+  , fadd
+  , fsub
+  , fmul
+  , fdiv
+  , fcmp
+  , uitofp
+  , toArgs
+
+  , call
+  , alloca
+  , store
+  , load
+
+  , br
+  , cbr
+  , ret
+
+  , uniqueName
+  ) where
 
 import Data.Bifunctor (first)
 import Data.Word
@@ -15,60 +49,53 @@ import qualified Data.ByteString.Short as BSS
 import Control.Monad.State
 import Control.Applicative
 
-import LLVM.AST
-import LLVM.AST.Global
-import qualified LLVM.AST as AST
+import qualified LLVM.AST as LLVM
 
-import qualified LLVM.AST.Linkage as L
-import qualified LLVM.AST.Constant as C
 import qualified LLVM.AST.Attribute as A
 import qualified LLVM.AST.CallingConvention as CC
+import qualified LLVM.AST.Constant as C
 import qualified LLVM.AST.FloatingPointPredicate as FP
-
--------------------------------------------------------------------------------
--- Module Level
--------------------------------------------------------------------------------
-
-newtype LLVM a = LLVM (State AST.Module a)
-  deriving (Functor, Applicative, Monad, MonadState AST.Module )
-
-runLLVM :: AST.Module -> LLVM a -> AST.Module
-runLLVM mod (LLVM m) = execState m mod
-
-emptyModule :: BS.ByteString -> AST.Module
-emptyModule label = defaultModule { moduleName = BSS.toShort label }
-
-addDefn :: Definition -> LLVM ()
-addDefn d = do
-  defs <- gets moduleDefinitions
-  modify $ \s -> s { moduleDefinitions = defs ++ [d] }
-
-define ::  Type -> BS.ByteString -> [(Type, Name)] -> [BasicBlock] -> LLVM ()
-define retty label argtys body = addDefn $
-  GlobalDefinition $ functionDefaults {
-    name        = Name $ BSS.toShort label
-  , parameters  = ([Parameter ty nm [] | (ty, nm) <- argtys], False)
-  , returnType  = retty
-  , basicBlocks = body
-  }
-
-external ::  Type -> BS.ByteString -> [(Type, Name)] -> LLVM ()
-external retty label argtys = addDefn $
-  GlobalDefinition $ functionDefaults {
-    name        = Name $ BSS.toShort label
-  , linkage     = L.External
-  , parameters  = ([Parameter ty nm [] | (ty, nm) <- argtys], False)
-  , returnType  = retty
-  , basicBlocks = []
-  }
+import qualified LLVM.AST.Global as G
+import qualified LLVM.AST.Linkage as L
 
 ---------------------------------------------------------------------------------
 -- Types
 -------------------------------------------------------------------------------
 
 -- IEEE 754 double
-double :: Type
-double = FloatingPointType DoubleFP
+double :: LLVM.Type
+double = LLVM.FloatingPointType LLVM.DoubleFP
+
+-- Specializing references to type Double
+
+localRef ::  LLVM.Name -> LLVM.Operand
+localRef = LLVM.LocalReference double
+
+globalRef ::  LLVM.Name -> C.Constant
+globalRef = C.GlobalReference double
+
+externfRef :: LLVM.Name -> LLVM.Operand
+externfRef = LLVM.ConstantOperand . C.GlobalReference double
+
+-------------------------------------------------------------------------------
+-- Code generation for a single basic block
+
+type SymbolTable = [(BS.ByteString, LLVM.Operand)]
+
+data CodegenState = CodegenState
+  { cs_currentBlock :: LLVM.Name                 -- Name of the active block to append to
+  , cs_blocks       :: Map.Map LLVM.Name BlockState -- Blocks for function
+  , cs_symbolTable  :: SymbolTable              -- Function scope symbol table
+  , cs_blockCount   :: Int                      -- Count of basic blocks
+  , cs_instrCount   :: Word                     -- Count of unnamed instructions
+  , cs_nameSupply   :: Names                    -- Name Supply
+  } deriving Show
+
+data BlockState = BlockState
+  { bs_index :: Int                            -- Block index
+  , bs_stack :: [LLVM.Named LLVM.Instruction]            -- Stack of instructions
+  , bs_terminator :: Maybe (LLVM.Named LLVM.Terminator)       -- Block terminator
+  } deriving Show
 
 -------------------------------------------------------------------------------
 -- Names
@@ -76,34 +103,19 @@ double = FloatingPointType DoubleFP
 
 type Names = Map.Map BS.ByteString Int
 
+-- Hey, this isn't guaranteed to make unique names
 uniqueName :: BS.ByteString -> Names -> (BS.ByteString, Names)
 uniqueName nm ns =
   case Map.lookup nm ns of
     Nothing -> (nm,  Map.insert nm 1 ns)
     Just ix -> (nm <> BS.pack (show ix), Map.insert nm (ix+1) ns)
 
--------------------------------------------------------------------------------
--- Codegen State
--------------------------------------------------------------------------------
-
-type SymbolTable = [(BS.ByteString, Operand)]
-
-data CodegenState
-  = CodegenState {
-    currentBlock :: Name                     -- Name of the active block to append to
-  , blocks       :: Map.Map Name BlockState  -- Blocks for function
-  , symtab       :: SymbolTable              -- Function scope symbol table
-  , blockCount   :: Int                      -- Count of basic blocks
-  , count        :: Word                     -- Count of unnamed instructions
-  , names        :: Names                    -- Name Supply
-  } deriving Show
-
-data BlockState
-  = BlockState {
-    idx   :: Int                            -- Block index
-  , stack :: [Named Instruction]            -- Stack of instructions
-  , term  :: Maybe (Named Terminator)       -- Block terminator
-  } deriving Show
+getName :: BS.ByteString -> Codegen BS.ByteString
+getName requestedName = do
+  nameSupply <- gets cs_nameSupply
+  let (name, nameSupply') = uniqueName requestedName nameSupply
+  modify $ \cs -> cs { cs_nameSupply = nameSupply' }
+  pure name
 
 -------------------------------------------------------------------------------
 -- Codegen Operations
@@ -112,91 +124,102 @@ data BlockState
 newtype Codegen a = Codegen { runCodegen :: State CodegenState a }
   deriving (Functor, Applicative, Monad, MonadState CodegenState )
 
-sortBlocks :: [(Name, BlockState)] -> [(Name, BlockState)]
-sortBlocks = sortBy (compare `on` (idx . snd))
+-- The point of the `Codegen` monad is to create a self-contained sequence of
+-- basic blocks.
+execCodegen :: Codegen a -> [LLVM.BasicBlock]
+execCodegen m = createBlocks $ execState (runCodegen m) emptyCodegen
 
-createBlocks :: CodegenState -> [BasicBlock]
-createBlocks m = map makeBlock $ sortBlocks $ Map.toList (blocks m)
-
-makeBlock :: (Name, BlockState) -> BasicBlock
-makeBlock (l, (BlockState _ s t)) = BasicBlock l (reverse s) (maketerm t)
+createBlocks :: CodegenState -> [LLVM.BasicBlock]
+createBlocks m = map makeBlock $ sortBlocks $ Map.toList (cs_blocks m)
   where
+  sortBlocks :: [(LLVM.Name, BlockState)] -> [(LLVM.Name, BlockState)]
+  sortBlocks = sortBy (compare `on` (bs_index . snd))
+
+  makeBlock :: (LLVM.Name, BlockState) -> LLVM.BasicBlock
+  makeBlock (label, (BlockState _ s t)) =
+    LLVM.BasicBlock label (reverse s) (maketerm t)
+    where
     maketerm (Just x) = x
-    maketerm Nothing = error $ "Block has no terminator: " ++ (show l)
+    maketerm Nothing = error $ "Block has no terminator: " ++ show label
 
 entryBlockName :: BS.ByteString
 entryBlockName = "entry"
 
 emptyBlock :: Int -> BlockState
-emptyBlock i = BlockState i [] Nothing
+emptyBlock i = BlockState
+  { bs_index = i
+  , bs_stack = []
+  , bs_terminator = Nothing
+  }
 
 emptyCodegen :: CodegenState
-emptyCodegen =
-  CodegenState (Name $ BSS.toShort entryBlockName) Map.empty [] 1 0 Map.empty
+emptyCodegen = CodegenState
+  { cs_currentBlock = LLVM.Name $ BSS.toShort entryBlockName
+  , cs_blocks = Map.empty
+  , cs_symbolTable = []
+  , cs_blockCount = 1
+  , cs_instrCount = 0
+  , cs_nameSupply = Map.empty
+  }
 
-execCodegen :: Codegen a -> CodegenState
-execCodegen m = execState (runCodegen m) emptyCodegen
+freshNum :: Codegen Word
+freshNum = do
+  i <- gets cs_instrCount
+  let i1 = i+1
+  modify $ \s -> s { cs_instrCount = i1 }
+  return i1
 
-fresh :: Codegen Word
-fresh = do
-  i <- gets count
-  modify $ \s -> s { count = 1 + i }
-  return $ i + 1
-
-instr :: Instruction -> Codegen (Operand)
+instr :: LLVM.Instruction -> Codegen (LLVM.Operand)
 instr ins = do
-  n <- fresh
-  let ref = (UnName n)
+  ref <- LLVM.UnName <$> freshNum
   blk <- current
-  let i = stack blk
-  modifyBlock (blk { stack = (ref := ins) : i } )
-  return $ local ref
+  let stack = bs_stack blk
+  modifyBlock (blk { bs_stack = (ref LLVM.:= ins) : stack } )
+  return $ localRef ref
 
-terminator :: Named Terminator -> Codegen (Named Terminator)
+terminator :: LLVM.Named LLVM.Terminator -> Codegen (LLVM.Named LLVM.Terminator)
 terminator trm = do
   blk <- current
-  modifyBlock (blk { term = Just trm })
+  modifyBlock (blk { bs_terminator = Just trm })
   return trm
 
 -------------------------------------------------------------------------------
 -- Block Stack
 -------------------------------------------------------------------------------
 
-entry :: Codegen Name
-entry = gets currentBlock
+entry :: Codegen LLVM.Name
+entry = gets cs_currentBlock
 
-addBlock :: BS.ByteString -> Codegen Name
-addBlock bname = do
-  bls <- gets blocks
-  ix  <- gets blockCount
-  nms <- gets names
+addBlock :: BS.ByteString -> Codegen LLVM.Name
+addBlock blockName = do
+  qname <- LLVM.Name . BSS.toShort <$> getName blockName
 
+  blocks <- gets cs_blocks
+  ix  <- gets cs_blockCount
   let new = emptyBlock ix
-      (qname, supply) = first BSS.toShort $ uniqueName bname nms
 
-  modify $ \s -> s { blocks = Map.insert (Name qname) new bls
-                   , blockCount = ix + 1
-                   , names = supply
+  modify $ \s -> s { cs_blocks = Map.insert qname new blocks
+                   , cs_blockCount = ix + 1
                    }
-  return (Name qname)
+  return qname
 
-setBlock :: Name -> Codegen Name
-setBlock bname = do
-  modify $ \s -> s { currentBlock = bname }
-  return bname
+setBlock :: LLVM.Name -> Codegen LLVM.Name
+setBlock blockName = do
+  modify $ \s -> s { cs_currentBlock = blockName }
+  return blockName
 
-getBlock :: Codegen Name
-getBlock = gets currentBlock
+getBlock :: Codegen LLVM.Name
+getBlock = gets cs_currentBlock
 
 modifyBlock :: BlockState -> Codegen ()
 modifyBlock new = do
-  active <- gets currentBlock
-  modify $ \s -> s { blocks = Map.insert active new (blocks s) }
+  active <- gets cs_currentBlock
+  modify $ \s -> s { cs_blocks = Map.insert active new (cs_blocks s) }
 
 current :: Codegen BlockState
 current = do
-  c <- gets currentBlock
-  blks <- gets blocks
+  c <- gets cs_currentBlock
+  blks <- gets cs_blocks
   case Map.lookup c blks of
     Just x -> return x
     Nothing -> error $ "No such block: " ++ show c
@@ -205,74 +228,66 @@ current = do
 -- Symbol Table
 -------------------------------------------------------------------------------
 
-assign :: BS.ByteString -> Operand -> Codegen ()
-assign var x = do
-  lcls <- gets symtab
-  modify $ \s -> s { symtab = [(var, x)] <> lcls }
+assignVar :: BS.ByteString -> LLVM.Operand -> Codegen ()
+assignVar var x = do
+  locals <- gets cs_symbolTable
+  modify $ \s -> s { cs_symbolTable = [(var, x)] <> locals }
 
-getvar :: BS.ByteString -> Codegen Operand
-getvar var = do
-  syms <- gets symtab
+getVar :: BS.ByteString -> Codegen LLVM.Operand
+getVar var = do
+  syms <- gets cs_symbolTable
   case lookup var syms of
     Just x  -> return x
     Nothing -> error $ "Local variable not in scope: " ++ show var
 
 -------------------------------------------------------------------------------
-
--- References
-local ::  Name -> Operand
-local = LocalReference double
-
-global ::  Name -> C.Constant
-global = C.GlobalReference double
-
-externf :: Name -> Operand
-externf = ConstantOperand . C.GlobalReference double
+-- Instructions (wrapped with `instr`)
 
 -- Arithmetic and Constants
-fadd :: Operand -> Operand -> Codegen Operand
-fadd a b = instr $ FAdd noFastMathFlags a b []
 
-fsub :: Operand -> Operand -> Codegen Operand
-fsub a b = instr $ FSub noFastMathFlags a b []
+fadd :: LLVM.Operand -> LLVM.Operand -> Codegen LLVM.Operand
+fadd a b = instr $ LLVM.FAdd LLVM.noFastMathFlags a b []
 
-fmul :: Operand -> Operand -> Codegen Operand
-fmul a b = instr $ FMul noFastMathFlags a b []
+fsub :: LLVM.Operand -> LLVM.Operand -> Codegen LLVM.Operand
+fsub a b = instr $ LLVM.FSub LLVM.noFastMathFlags a b []
 
-fdiv :: Operand -> Operand -> Codegen Operand
-fdiv a b = instr $ FDiv noFastMathFlags a b []
+fmul :: LLVM.Operand -> LLVM.Operand -> Codegen LLVM.Operand
+fmul a b = instr $ LLVM.FMul LLVM.noFastMathFlags a b []
 
-fcmp :: FP.FloatingPointPredicate -> Operand -> Operand -> Codegen Operand
-fcmp cond a b = instr $ FCmp cond a b []
+fdiv :: LLVM.Operand -> LLVM.Operand -> Codegen LLVM.Operand
+fdiv a b = instr $ LLVM.FDiv LLVM.noFastMathFlags a b []
 
-cons :: C.Constant -> Operand
-cons = ConstantOperand
+fcmp :: FP.FloatingPointPredicate -> LLVM.Operand -> LLVM.Operand -> Codegen LLVM.Operand
+fcmp cond a b = instr $ LLVM.FCmp cond a b []
 
-uitofp :: Type -> Operand -> Codegen Operand
-uitofp ty a = instr $ UIToFP a ty []
+uitofp :: LLVM.Type -> LLVM.Operand -> Codegen LLVM.Operand
+uitofp ty a = instr $ LLVM.UIToFP a ty []
 
-toArgs :: [Operand] -> [(Operand, [A.ParameterAttribute])]
+toArgs :: [LLVM.Operand] -> [(LLVM.Operand, [A.ParameterAttribute])]
 toArgs = map (\x -> (x, []))
 
 -- Effects
-call :: Operand -> [Operand] -> Codegen Operand
-call fn args = instr $ Call Nothing CC.C [] (Right fn) (toArgs args) [] []
 
-alloca :: Type -> Codegen Operand
-alloca ty = instr $ Alloca ty Nothing 0 []
+call :: LLVM.Operand -> [LLVM.Operand] -> Codegen LLVM.Operand
+call fn args = instr $ LLVM.Call Nothing CC.C [] (Right fn) (toArgs args) [] []
 
-store :: Operand -> Operand -> Codegen Operand
-store ptr val = instr $ Store False ptr val Nothing 0 []
+alloca :: LLVM.Type -> Codegen LLVM.Operand
+alloca ty = instr $ LLVM.Alloca ty Nothing 0 []
 
-load :: Operand -> Codegen Operand
-load ptr = instr $ Load False ptr Nothing 0 []
+store :: LLVM.Operand -> LLVM.Operand -> Codegen LLVM.Operand
+store ptr val = instr $ LLVM.Store False ptr val Nothing 0 []
 
--- Control Flow
-br :: Name -> Codegen (Named Terminator)
-br val = terminator $ Do $ Br val []
+load :: LLVM.Operand -> Codegen LLVM.Operand
+load ptr = instr $ LLVM.Load False ptr Nothing 0 []
 
-cbr :: Operand -> Name -> Name -> Codegen (Named Terminator)
-cbr cond tr fl = terminator $ Do $ CondBr cond tr fl []
+-------------------------------------------------------------------------------
+-- Control Flow (wrapped with `terminator`)
 
-ret :: Operand -> Codegen (Named Terminator)
-ret val = terminator $ Do $ Ret (Just val) []
+br :: LLVM.Name -> Codegen (LLVM.Named LLVM.Terminator)
+br val = terminator $ LLVM.Do $ LLVM.Br val []
+
+cbr :: LLVM.Operand -> LLVM.Name -> LLVM.Name -> Codegen (LLVM.Named LLVM.Terminator)
+cbr cond tr fl = terminator $ LLVM.Do $ LLVM.CondBr cond tr fl []
+
+ret :: LLVM.Operand -> Codegen (LLVM.Named LLVM.Terminator)
+ret val = terminator $ LLVM.Do $ LLVM.Ret (Just val) []

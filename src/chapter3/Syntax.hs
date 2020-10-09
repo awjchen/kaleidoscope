@@ -13,3 +13,4 @@ data Expr
   | BinaryOp Name Expr Expr
   | UnaryOp Name Expr
   deriving (Eq, Ord, Show)
+
