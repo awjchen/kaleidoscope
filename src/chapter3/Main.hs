@@ -2,17 +2,17 @@
 
 module Main where
 
-import Parser
-import Codegen
-import Emit
-
 import Control.Monad.Trans
-
 import System.IO
 import System.Environment
 import System.Console.Haskeline
 
 import qualified LLVM.AST as AST
+
+import Parser (parseToplevel)
+import ModuleGen (emptyModule)
+import Emit (codegen)
+
 
 initModule :: AST.Module
 initModule = emptyModule "my cool jit"
