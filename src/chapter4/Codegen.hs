@@ -24,6 +24,7 @@ import qualified LLVM.AST.Constant as C
 import qualified LLVM.AST.Attribute as A
 import qualified LLVM.AST.CallingConvention as CC
 import qualified LLVM.AST.FloatingPointPredicate as FP
+import LLVM.AST.AddrSpace
 
 -------------------------------------------------------------------------------
 -- Module Level
@@ -68,7 +69,14 @@ external retty label argtys = addDefn $
 
 -- IEEE 754 double
 double :: Type
-double = FloatingPointType DoubleFP
+double = FloatingPointType FloatFP
+
+functiontype :: Type
+functiontype = FunctionType {resultType = double, argumentTypes = [double], isVarArg = False}
+
+pointer :: Type
+pointer = PointerType{pointerReferent = functiontype, pointerAddrSpace = AddrSpace 0}
+
 
 -------------------------------------------------------------------------------
 -- Names

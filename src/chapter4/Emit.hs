@@ -19,6 +19,7 @@ import Control.Applicative
 import qualified Data.Map as Map
 
 import Codegen
+import JIT
 import qualified Syntax as S
 
 toSig :: [BS.ByteString] -> [(AST.Type, AST.Name)]
@@ -68,13 +69,6 @@ binops = Map.fromList [
   ]
 
 cgen :: S.Expr -> Codegen AST.Operand
-cgen (S.UnaryOp op a) = do
-  cgen $ S.Call ("unary" <> op) [a]
-cgen (S.BinaryOp "=" (S.Var var) val) = do
-  a <- getvar (BS.pack var)
-  cval <- cgen val
-  store a cval
-  return cval
 cgen (S.BinaryOp op a b) = do
   case Map.lookup op binops of
     Just f  -> do
@@ -96,11 +90,11 @@ liftError :: ExceptT String IO a -> IO a
 liftError = runExceptT >=> either fail return
 
 codegen :: AST.Module -> [S.Expr] -> IO AST.Module
-codegen mod fns = withContext $ \context ->
-  withModuleFromAST context newast $ \m -> do
-    llstr <- moduleLLVMAssembly m
-    BS.putStrLn llstr
-    return newast
+codegen mod fns = do
+  res <- runJIT oldast
+  case res  of
+    Right newast -> return newast
+    Left err     -> putStrLn err >> return oldast
   where
     modn    = mapM codegenTop fns
-    newast  = runLLVM mod modn
+    oldast = runLLVM mod modn
